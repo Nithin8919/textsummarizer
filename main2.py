@@ -1,6 +1,7 @@
 import logging
 from transformers import AutoTokenizer, pipeline
 import gradio as gr
+from src.textSummarizer.pipeline.predicition_pipeline import PredictionPipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 

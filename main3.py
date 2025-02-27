@@ -1,17 +1,29 @@
 import logging
+import os
 from transformers import AutoTokenizer, pipeline
 import gradio as gr
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-class LightweightSummarizer:
-    def __init__(self):
+class SuperSummarizer:
+    def __init__(self, legal_docs_path="legal_documents/"):
         self.tokenizer = None
         self.summarizer = None
+        self.retriever = None
+        self.index = None
+        self.documents = []
+        self.legal_docs_path = legal_docs_path  # Path to legal documents
         self._load_pipeline()
+        self._load_retriever()
 
     def _load_pipeline(self):
+        """Load the summarization pipeline."""
         try:
             model_name = "sshleifer/distilbart-cnn-6-6"
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -26,22 +38,98 @@ class LightweightSummarizer:
             logging.error(f"Error loading pipeline: {e}")
             raise
 
-    def summarize(self, text, max_input_length=1024, max_summary_length=256, min_summary_length=50, length_penalty=1.0):
+    def _load_retriever(self):
+        """Load FAISS retriever with legal documents."""
+        try:
+            self.retriever = SentenceTransformer('all-MiniLM-L6-v2')  # Lightweight model
+            self.documents = self._load_documents()  # Load legal documents
+
+            if not self.documents:
+                logging.warning("No legal documents found. RAG retrieval will be limited.")
+                return
+            
+            embeddings = self.retriever.encode(self.documents, normalize_embeddings=True)
+            self.index = faiss.IndexFlatIP(embeddings.shape[1])  # Cosine similarity
+            self.index.add(embeddings)
+            logging.info(f"Loaded {len(self.documents)} legal documents into FAISS index")
+        except Exception as e:
+            logging.error(f"Error loading retriever: {e}")
+            raise
+
+    def _load_documents(self):
+        """Load all legal documents from a folder."""
+        docs = []
+        if not os.path.exists(self.legal_docs_path):
+            logging.warning(f"Legal documents folder '{self.legal_docs_path}' not found.")
+            return docs
+
+        for filename in os.listdir(self.legal_docs_path):
+            if filename.endswith(".txt"):  
+                with open(os.path.join(self.legal_docs_path, filename), "r", encoding="utf-8") as f:
+                    docs.append(f.read().strip())
+
+        logging.info(f"Loaded {len(docs)} legal documents.")
+        return docs
+
+    def retrieve_context(self, text, k=2):
+        """Retrieve relevant legal documents using FAISS."""
+        try:
+            if not self.documents:
+                logging.warning("No legal documents indexed. Retrieval skipped.")
+                return ""
+            
+            query_embedding = self.retriever.encode([text], normalize_embeddings=True)
+            distances, indices = self.index.search(query_embedding, k)
+            retrieved_docs = [self.documents[idx] for idx in indices[0]]
+            return " ".join(retrieved_docs)
+        except Exception as e:
+            logging.error(f"Error retrieving context: {e}")
+            return ""
+
+    def web_search(self, query, max_chars=1000):
+        """Web search for additional context."""
+        try:
+            search_url = f"https://www.google.com/search?q={query}"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(search_url, headers=headers)
+            soup = BeautifulSoup(response.text, "html.parser")
+            snippets = soup.find_all("span")
+            context = " ".join([s.get_text() for s in snippets[:5]])[:max_chars]
+            return context
+        except Exception as e:
+            logging.error(f"Error in web search: {e}")
+            return ""
+
+    def summarize(self, text, max_input_length=1024, max_summary_length=256, min_summary_length=50, use_rag=False):
+        """Summarize input text with optional RAG enhancement."""
         try:
             if not text or not isinstance(text, str):
                 return "Error: Please enter a non-empty text string."
+
             tokens = self.tokenizer(text, truncation=True, max_length=max_input_length, return_tensors="pt")
             truncated_text = self.tokenizer.decode(tokens["input_ids"][0], skip_special_tokens=True)
+
+            # RAG enhancement
+            if use_rag:
+                context = self.retrieve_context(truncated_text)
+                if not context:
+                    context = self.web_search(truncated_text[:50])  # Use first 50 chars as query
+                enhanced_input = f"{truncated_text} Additional context: {context}"
+                logging.info("Using RAG with retrieved context")
+            else:
+                enhanced_input = truncated_text
+
             gen_kwargs = {
-                "length_penalty": length_penalty,
+                "length_penalty": 1.0,
                 "num_beams": 6,
                 "max_length": max_summary_length,
                 "min_length": min_summary_length,
                 "no_repeat_ngram_size": 3,
                 "early_stopping": True
             }
+
             logging.info("Generating summary...")
-            summary = self.summarizer(truncated_text, **gen_kwargs)[0]["summary_text"]
+            summary = self.summarizer(enhanced_input, **gen_kwargs)[0]["summary_text"]
             logging.info("Summary generated successfully.")
             return summary
         except Exception as e:
@@ -49,73 +137,26 @@ class LightweightSummarizer:
             return f"Error: {str(e)}"
 
 # Initialize summarizer
-summarizer = LightweightSummarizer()
+summarizer = SuperSummarizer()
 
-# Gradio function
-def summarize_text(input_text, summary_length, verbosity):
+# Gradio interface function
+def summarize_text(input_text, summary_length, use_rag):
     max_len = int(summary_length)
-    length_pen = float(verbosity)
-    summary = summarizer.summarize(
-        input_text,
-        max_summary_length=max_len,
-        min_summary_length=max_len//2,
-        length_penalty=length_pen
-    )
-    return summary, "Done!"  # Return summary and status
+    return summarizer.summarize(input_text, max_summary_length=max_len, min_summary_length=max_len//2, use_rag=use_rag)
 
-# Clear function
-def clear_input():
-    return "", "", "Ready"
+# Create Gradio interface
+interface = gr.Interface(
+    fn=summarize_text,
+    inputs=[
+        gr.Textbox(lines=10, placeholder="Enter your text here...", label="Input Text"),
+        gr.Slider(minimum=128, maximum=512, step=64, value=256, label="Summary Length (tokens)"),
+        gr.Checkbox(label="Enhance with RAG (Retrieval-Augmented Generation)", value=False)
+    ],
+    outputs=gr.Textbox(label="Super Summary"),
+    title="Text Summarization using Nlp and Transformers",
+    description="Summarize text with optional RAG enhancement for richer context. Works with legal documents!",
+    theme="huggingface"
+)
 
-# Custom CSS for a cool look
-custom_css = """
-body { font-family: 'Arial', sans-serif; background-color: #1e1e1e; color: #ffffff; }
-.gradio-container { max-width: 900px; margin: 20px auto; padding: 20px; background: #2b2b2b; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
-h1 { color: #00d4ff; text-align: center; font-size: 2.5em; margin-bottom: 20px; text-shadow: 0 0 10px rgba(0, 212, 255, 0.5); }
-textarea { background-color: #333333 !important; color: #ffffff !important; border: 1px solid #00d4ff !important; border-radius: 8px; }
-button { background: linear-gradient(45deg, #00d4ff, #007bff); border: none; color: white; padding: 10px 20px; border-radius: 5px; font-weight: bold; transition: all 0.3s; }
-button:hover { transform: scale(1.05); box-shadow: 0 0 15px rgba(0, 212, 255, 0.7); }
-.slider { background: #444444; border-radius: 10px; }
-.label { color: #00d4ff; font-weight: bold; }
-.output_text { background-color: #333333; color: #e0e0e0; border: 1px solid #00d4ff; border-radius: 8px; padding: 10px; }
-.status { font-size: 0.9em; color: #00ff00; text-align: center; }
-"""
-
-# Gradio interface with Blocks
-with gr.Blocks(title="Super Summarizer", css=custom_css) as interface:
-    gr.Markdown("# Super Summarizer")
-    gr.Markdown("Transform your text into concise, cool summaries with ease!")
-
-    with gr.Row():
-        with gr.Column(scale=2):
-            input_box = gr.Textbox(
-                lines=10, placeholder="Drop your text here...", label="Input Text",
-                elem_classes="input_text"
-            )
-            output_box = gr.Textbox(
-                label="Your Summary", lines=5, interactive=False, elem_classes="output_text"
-            )
-        with gr.Column(scale=1):
-            summary_length = gr.Slider(128, 512, step=64, value=256, label="Summary Length (tokens)")
-            verbosity = gr.Slider(0.5, 2.0, step=0.1, value=1.0, label="Verbosity (Length Penalty)")
-            with gr.Row():
-                submit_btn = gr.Button("Summarize", variant="primary")
-                clear_btn = gr.Button("Clear", variant="secondary")
-            status = gr.Textbox(value="Ready", label="Status", interactive=False, elem_classes="status")
-
-    # Bind actions
-    submit_btn.click(
-        fn=summarize_text,
-        inputs=[input_box, summary_length, verbosity],
-        outputs=[output_box, status],
-        _js="() => {document.querySelector('.status').value = 'Summarizing...';}"  # JS for progress
-    )
-    clear_btn.click(
-        fn=clear_input,
-        inputs=[],
-        outputs=[input_box, output_box, status]
-    )
-
-# Launch
 if __name__ == "__main__":
-    interface.launch()
+    interface.launch(share=True)
