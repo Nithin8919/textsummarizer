@@ -7,6 +7,9 @@ import faiss
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
+from src.textSummarizer.components.model_evaluation import ModelEvaluation
+from src.textSummarizer.entity import ModelEvaluationConfig
+from pathlib import Path
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -19,6 +22,13 @@ class SuperSummarizer:
         self.index = None
         self.documents = []
         self.legal_docs_path = legal_docs_path  # Path to legal documents
+        self.evaluator = ModelEvaluation(ModelEvaluationConfig(
+        root_dir=Path("evaluation/"),
+        data_path=Path(""),
+        model_path=Path(""),
+        tokenizer_path=Path(""),
+        metric_file_name=Path("evaluation_results.csv")))
+
         self._load_pipeline()
         self._load_retriever()
 
@@ -136,13 +146,23 @@ class SuperSummarizer:
             logging.error(f"Error during summarization: {e}")
             return f"Error: {str(e)}"
 
+    def evaluate_summary(self, reference, generated):
+        """Evaluate the summary using ROUGE scores."""
+        return self.evaluator.evaluate_summary(reference, generated)
+
+
 # Initialize summarizer
 summarizer = SuperSummarizer()
 
 # Gradio interface function
 def summarize_text(input_text, summary_length, use_rag):
     max_len = int(summary_length)
-    return summarizer.summarize(input_text, max_summary_length=max_len, min_summary_length=max_len//2, use_rag=use_rag)
+    summary = summarizer.summarize(input_text, max_summary_length=max_len, min_summary_length=max_len//2, use_rag=use_rag)
+    
+    reference_text = input_text[:512]  # Take part of the input as reference
+    scores = summarizer.evaluate_summary(reference_text, summary)
+
+    return summary, scores
 
 # Create Gradio interface
 interface = gr.Interface(
@@ -152,9 +172,12 @@ interface = gr.Interface(
         gr.Slider(minimum=128, maximum=512, step=64, value=256, label="Summary Length (tokens)"),
         gr.Checkbox(label="Enhance with RAG (Retrieval-Augmented Generation)", value=False)
     ],
-    outputs=gr.Textbox(label="Super Summary"),
-    title="Text Summarization using Nlp and Transformers",
-    description="Summarize text with optional RAG enhancement for richer context. Works with legal documents!",
+    outputs=[
+        gr.Textbox(label="Super Summary"),
+        gr.JSON(label="Evaluation Scores")
+    ],
+    title="Text Summarization with Evaluation",
+    description="Summarize text and get evaluation scores using ROUGE metrics. Works with legal documents!",
     theme="huggingface"
 )
 
